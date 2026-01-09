@@ -10,8 +10,6 @@ class TreeNode:
         self.jerk = jerk
 
 def sample_range(x0, q_prime, q_double, N, delta, limits):
-    # Use toppra to compute velocity and acceleration bounds without jerk
-    # Assume q_prime is waypoints (N+1, n_dof), ss = np.cumsum(delta) with s0=0
     ss = np.zeros(N+1)
     ss[1:] = np.cumsum(delta)
     path = ta.SplineInterpolator(ss, q_prime)  # Geometric path
@@ -26,7 +24,7 @@ def sample_range(x0, q_prime, q_double, N, delta, limits):
     for i in range(N+1):
         cs = instance.controllable_sets[i, :]  # [low, high] for u at gridpoint i, but need x bounds
         # From controllable sets, x bounds are derived from velocity constraints
-        # Simplified: compute max min from velocity
+        # 最大最小速度界限
         x_lower = 0  # Assume non-negative
         x_upper = min(np.min((vlim[:,1] / q_prime[i,:])**2), np.inf)  # Approximate, adjust per Eq.11
         L.append((x_lower, x_upper))
