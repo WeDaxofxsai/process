@@ -1,111 +1,119 @@
-import math
-import toppra as ta
-import toppra.constraint as constraint
 import numpy as np
-import toppra.algorithm as algo
-import matplotlib.pyplot as plt
+import toppra as ta  # External library for TOPP-RA computations
 
-def get_x_upper_bound_via_toppra_api(file, vlim, alim):
-    """使用TOPPRA API直接获取x上界"""
-    
+class TreeNode:
+    def __init__(self, x, parent=None, cost=0.0, u=0.0, jerk=0.0):
+        self.x = x
+        self.parent = parent
+        self.cost = cost
+        self.u = u
+        self.jerk = jerk
 
-    joint_trajectory = []
-    with open(file, 'r') as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            values = line.split(',')
-            try:
-                # 转换为浮点数，取前6个值
-                joints = [float(val) for val in values[:6]]
-                if len(joints) == 6:
-                    joint_trajectory.append(joints)
-                else:
-                    print(f"警告: 第{line_num}行只有{len(joints)}个值，跳过")
-            except ValueError as e:
-                print(f"警告: 第{line_num}行包含无效数据，跳过: {line}")
-                continue
-    joint_waypoints = np.array(joint_trajectory)
-    path_param = np.linspace(0, 1, len(joint_waypoints))
+def sample_range(x0, q_prime, q_double, N, delta, limits):
+    # Use toppra to compute velocity and acceleration bounds without jerk
+    # Assume q_prime is waypoints (N+1, n_dof), ss = np.cumsum(delta) with s0=0
+    ss = np.zeros(N+1)
+    ss[1:] = np.cumsum(delta)
+    path = ta.SplineInterpolator(ss, q_prime)  # Geometric path
+    vlim = limits['vel']  # [q_min, q_max] shape (n_dof, 2)
+    alim = limits['acc']  # [q_ddot_min, q_ddot_max] shape (n_dof, 2)
+    pc_vel = ta.constraint.JointVelocityConstraint(vlim)
+    pc_acc = ta.constraint.JointAccelerationConstraint(alim)
+    instance = ta.algorithm.TOPPRA([pc_vel, pc_acc], path, gridpoints_min= N+1)
+    _ = instance.compute_trajectory(0, 0)  # Compute to get controllable sets
+    # Extract bounds for x_i = s_dot^2
+    L = []
+    for i in range(N+1):
+        cs = instance.controllable_sets[i, :]  # [low, high] for u at gridpoint i, but need x bounds
+        # From controllable sets, x bounds are derived from velocity constraints
+        # Simplified: compute max min from velocity
+        x_lower = 0  # Assume non-negative
+        x_upper = min(np.min((vlim[:,1] / q_prime[i,:])**2), np.inf)  # Approximate, adjust per Eq.11
+        L.append((x_lower, x_upper))
+    return L
 
-    path = ta.SplineInterpolator(
-        path_param,
-        joint_waypoints
-    )
-    
-    pc_vel = constraint.JointVelocityConstraint(vlim)
-    pc_acc = constraint.JointAccelerationConstraint(alim)
-    instance = algo.TOPPRA([pc_vel, pc_acc], path)
-    sd_start = 0.0
-    sd_end = 0.0
-    
-    try:
-        sdd_vec, sd_vec, v_vec, K = instance.compute_parameterization(
-            sd_start, sd_end, return_data=True
-        )
-        s_dot_min = K[:, 0]  # 最小速度
-        s_dot_max = K[:, 1]  # 最大速度
-        
-        if hasattr(instance, 'gridpoints'):
-            ss = instance.gridpoints
-        else:
-            # 从problem_data获取
-            problem_data = instance.problem_data
-            if 'gridpoints' in problem_data:
-                ss = problem_data['gridpoints']
-            else:
-                # 默认创建
-                N = len(sd_vec) - 1
-                ss = np.linspace(0, 1, N+1)
-        
-        x_upper = s_dot_max**2
-        return ss, s_dot_min, s_dot_max, x_upper, sd_vec
-        
-    except Exception as e:
-        print(f"计算失败: {e}")
+def sample_pasf(L_i, V_open_prev, delta_i_minus1, f):
+    samples = []
+    # PASF: use historical u to predict x_i
+    for node in V_open_prev:
+        u_prev = node.u  # Assume u_{i-2} is stored as node.u
+        x_pred = node.x + 2 * delta_i_minus1 * u_prev
+        if L_i[0] <= x_pred <= L_i[1]:
+            samples.append(x_pred)
+    # Add f uniform samples
+    uniform = np.linspace(L_i[0], L_i[1], f)
+    samples.extend(uniform)
+    return list(set(samples))  # Remove duplicates
+
+def near_parents(x, V_open_prev, num_unvisited, L_i, epsilon):
+    delta_x = (L_i[1] - L_i[0]) / num_unvisited
+    r = delta_x * epsilon
+    near = [node for node in V_open_prev if abs(node.x - x) <= r]
+    return near
+
+def find_parent(x, q_prime_i_minus1, q_double_i_minus1, q_triple_i_minus1, V_near, delta_i_minus1, limits):
+    costs = {}
+    for z in V_near:
+        cost = 2 * delta_i_minus1 / (np.sqrt(z.x) + np.sqrt(x))  # Eq.25, s_dot = sqrt(x)
+        costs[cost] = z
+    sorted_costs = sorted(costs.items())
+    for c, z in sorted_costs:
+        if valid_node(q_prime_i_minus1, q_double_i_minus1, q_triple_i_minus1, z, x, delta_i_minus1, limits, z.u):
+            return z
+    return None
+
+def valid_node(q_prime_i_minus1, q_double_i_minus1, q_triple_i_minus1, z, x, delta_i_minus1, limits, prev_u, prev_t=None):
+    u = (x - z.x) / (2 * delta_i_minus1)
+    # Compute jerk
+    if prev_t is None:
+        prev_t = delta_i_minus1 / np.sqrt(z.x)  # Approximate time
+    jerk = (u - prev_u) / prev_t
+    # Compute joint acc and jerk
+    s_dot = np.sqrt(x)
+    q_dot = q_prime_i_minus1 * s_dot
+    q_ddot = q_double_i_minus1 * s_dot**2 + q_prime_i_minus1 * u
+    q_dddot = q_triple_i_minus1 * s_dot**3 + 3 * q_double_i_minus1 * s_dot * u + q_prime_i_minus1 * jerk
+    # Check bounds
+    if np.all(limits['acc'][0] <= q_ddot) and np.all(q_ddot <= limits['acc'][1]) and \
+       np.all(limits['jerk'][0] <= q_dddot) and np.all(q_dddot <= limits['jerk'][1]):
+        return True
+    return False
+
+def connect(parent, child_x, delta_i_minus1, limits):
+    u = (child_x - parent.x) / (2 * delta_i_minus1)
+    # Compute jerk, assume prev_u = parent.u, prev_t approximate
+    prev_t = delta_i_minus1 / np.sqrt(parent.x)
+    jerk = (u - parent.u) / prev_t
+    cost = parent.cost + 2 * delta_i_minus1 / (np.sqrt(parent.x) + np.sqrt(child_x))
+    return TreeNode(child_x, parent, cost, u, jerk)
+
+def solution(T, end_nodes):
+    if not end_nodes:
         return None
+    min_node = min(end_nodes, key=lambda n: n.cost)
+    path = []
+    current = min_node
+    while current:
+        path.append(current.x)
+        current = current.parent
+    return path[::-1]
 
-def visualize_results(ss, s_dot_min, s_dot_max, x_upper, sd_vec):
-    """可视化结果"""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # 1. 速度可行区间
-    ax = axes[0, 0]
-    ax.fill_between(ss, s_dot_min, s_dot_max, alpha=0.3, color='blue', label='Feasible region')
-    ax.plot(ss, s_dot_min, 'r--', label='Minimum speed')
-    ax.plot(ss, s_dot_max, 'g-', label='Maximum speed')
-    if sd_vec is not None:
-        ax.plot(ss, sd_vec**2, 'b-', linewidth=2, label='Actual speed')
-    ax.set_xlabel('Path parameter $s$')
-    ax.set_ylabel('Path velocity $\dot{s}$')
-    ax.set_title('Velocity Feasible Region')
-    ax.legend()
-    ax.grid(True)
-
-    plt.tight_layout()
-    plt.show()
-
-# 主程序
-if __name__ == "__main__":
-
-    vlim = np.array([[-1.74, 1.74], [-1.74, 1.74], [-1.74, 1.74], [-1.74, 1.74], [-1.74, 1.74], [-1.74, 1.74]])  # 关节速度限制
-    alim = np.array([[-1.74, 1.74], [-1.74, 1.74], [-1.74, 1.74], [-1.74, 1.74], [-1.74, 1.74], [-1.74, 1.74]])  # 关节加速度限制
-    result = get_x_upper_bound_via_toppra_api("./source/test_joint.txt", vlim, alim)
-    
-    if result is not None:
-        ss, s_dot_min, s_dot_max, x_upper, sd_vec = result
-        
-        # 打印基本信息
-        print("ss ", len(ss))
-        print("s_dot_min ", len(s_dot_min))
-        print("s_dot_max ", len(s_dot_max))
-        print("x_upper ", len(x_upper))
-        print("sd_vec ", len(sd_vec))
-        print(f"网格点数量: {len(ss)}")
-        print(f"速度可行区间形状: {s_dot_min.shape}")
-        print(f"x上界形状: {x_upper.shape}")
-        
-        # 可视化
-        visualize_results(ss, s_dot_min, s_dot_max, x_upper, sd_vec)
-        print("数据已保存到 velocity_feasible_region.npz")
-    else:
-        print("无法获取速度可行区间")
+def S_TOPP(x0, q_prime, q_double, q_triple, N, delta, limits, f=5, epsilon=10):
+    root = TreeNode(x0, cost=0.0, u=0.0, jerk=0.0)
+    T = [root]  # List or dict for tree
+    V_open = [[root]]  # List of lists, V_open[i]
+    L = sample_range(x0, q_prime, q_double, N, delta, limits)
+    for i in range(1, N+1):
+        V_unvisited_i = sample_pasf(L[i], V_open[i-1], delta[i-1], f)
+        V_open_i = []
+        for x in V_unvisited_i:
+            V_near = near_parents(x, V_open[i-1], len(V_unvisited_i), L[i], epsilon)
+            y = find_parent(x, q_prime[i-1], q_double[i-1], q_triple[i-1], V_near, delta[i-1], limits)
+            if y:
+                node = connect(y, x, delta[i-1], limits)
+                V_open_i.append(node)
+                T.append(node)
+        V_open.append(V_open_i)
+        if not V_open_i:
+            return None
+    return solution(T, V_open[N])
